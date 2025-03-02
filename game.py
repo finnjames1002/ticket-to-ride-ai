@@ -9,6 +9,7 @@ from mcts import MCTS
 from console import LiveConsole
 from graph import TicketToRideVisualizer
 from fw import FloydWarshall
+from randomAgent import RandomAgent
 
 class Color(Enum):
     RED = "red"
@@ -96,8 +97,6 @@ class Route:
     def is_claimed(self) -> bool:
         return self.claimed_by is not None
     
-console = LiveConsole()
-
 # Handles the game state, including the board, players, current player index, score, train deck, destination deck, and face-up cards
 class GameState:
     def __init__(self):
@@ -111,6 +110,7 @@ class GameState:
         self.face_up_cards: List[Color] = []
         self.visualizer = TicketToRideVisualizer(self)
         self.fw = None    
+        self.update = None
 
     def init(self):
         self.initialise_destination_deck()
@@ -124,43 +124,42 @@ class GameState:
         self.current_player = self.players[self.current_player_idx]
 
     def init_uf(self):
-        uf = UnionFind(self.routes.keys())
         for player in self.players:
-            player.uf = uf  
+            player.uf = UnionFind(self.routes.keys())
 
     def initialise_destination_deck(self):
         # Add destination tickets to the deck
         destinations = [
-            Destination("Los Angeles", "New York", 21),
-            Destination("Duluth", "Houston", 8),
-            Destination("Sault St. Marie", "Nashville", 8),
+            Destination("Denver", "El Paso", 4),
+            Destination("Kansas City", "Houston", 5),
             Destination("New York", "Atlanta", 6),
-            Destination("Portland", "Nashville", 17),
-            Destination("Vancouver", "Montreal", 20),
+            Destination("Calgary", "Salt Lake City", 7),
+            Destination("Chicago", "New Orleans", 7),
+            Destination("Duluth", "Houston", 8),
+            Destination("Helena", "Los Angeles", 8),
+            Destination("Sault St. Marie", "Nashville", 8),
+            Destination("Sault St. Marie", "Oklahoma City", 9),
+            Destination("Chicago", "Santa Fe", 9),
+            Destination("Montreal", "Atlanta", 9),
+            Destination("Seattle", "Los Angeles", 9),
             Destination("Duluth", "El Paso", 10),
             Destination("Toronto", "Miami", 10),
-            Destination("Portland", "Phoenix", 11),
             Destination("Dallas", "New York", 11),
-            Destination("Calgary", "Salt Lake City", 7),
-            Destination("Calgary", "Phoenix", 13),
-            Destination("Los Angeles", "Miami", 20),
-            Destination("Winnipeg", "Little Rock", 11),
-            Destination("San Francisco", "Atlanta", 17),
-            Destination("Kansas City", "Houston", 5),
-            Destination("Los Angeles", "Chicago", 16),
             Destination("Denver", "Pittsburgh", 11),
-            Destination("Chicago", "Santa Fe", 9),
-            Destination("Vancouver", "Santa Fe", 13),
+            Destination("Portland", "Phoenix", 11),
+            Destination("Winnipeg", "Little Rock", 11),
             Destination("Boston", "Miami", 12),
-            Destination("Chicago", "New Orleans", 7),
-            Destination("Montreal", "Atlanta", 9),
-            Destination("Seattle", "New York", 22),
-            Destination("Denver", "El Paso", 4),
-            Destination("Helena", "Los Angeles", 8),
             Destination("Winnipeg", "Houston", 12),
+            Destination("Calgary", "Phoenix", 13),
             Destination("Montreal", "New Orleans", 13),
-            Destination("Sault St. Marie", "Oklahoma City", 9),
-            Destination("Seattle", "Los Angeles", 9),
+            Destination("Vancouver", "Santa Fe", 13),
+            Destination("Los Angeles", "Chicago", 16),
+            Destination("Portland", "Nashville", 17),
+            Destination("San Francisco", "Atlanta", 17),
+            Destination("Los Angeles", "Miami", 20),
+            Destination("Vancouver", "Montreal", 20),
+            Destination("Los Angeles", "New York", 21),
+            Destination("Seattle", "New York", 22)
         ]
         self.destination_deck = destinations
         random.shuffle(self.destination_deck)
@@ -378,6 +377,7 @@ class GameState:
                     Route(length=4, color=Color.ORANGE)
                 ],
                 "Omaha": [
+                    Route(length=1, color=Color.GRAY),
                     Route(length=1, color=Color.GRAY)
                 ]
             },
@@ -782,9 +782,8 @@ class GameState:
             claimed = route.is_claimed()
             if (color == Color.WILD or route.color == color or route.color == Color.GRAY) and not (claimed):
                 route.claim(player)
-
                 return True
-            return False
+        return False
 
     def claim_route(self, city1: str, city2: str, color: Color, player: str) -> bool:
         """Attempt to claim a route between two cities."""
@@ -813,7 +812,6 @@ class GameState:
         for color in Color:
             if color != Color.WILD and color != Color.GRAY:
                 self.train_deck.extend([color] * 12)
-            
         self.train_deck.extend([Color.WILD] * 14)
         random.shuffle(self.train_deck)
 
@@ -856,13 +854,30 @@ class GameState:
             return 10
         elif route_length == 6:
             return 15
-    
+        
+    def print_owned_routes(self):
+        for player in self.players:
+            print(f"{player.name} has claimed the following routes:")
+            for city1, city2, color in player.claimed_connections:
+                print(f"{city1} to {city2} with {color} and length {self.get_route_length(city1, city2, color)}")
+
     # MCTS methods
     def copy(self):
-        # Create a deep copy of the game state
-        new_state = GameState()
+        # Store the update reference
+        update_ref = self.update
+        
+        # Set it to None temporarily for copying
+        self.update = None
+        
+        # Create copy
         new_state = copy.deepcopy(self)
+        
+        # Restore the update reference in both objects
+        self.update = update_ref
+        new_state.update = update_ref
+        
         return new_state
+    
     
     def apply_action(self, action):
         action_type = action[0]
@@ -889,7 +904,7 @@ class GameState:
                 self.players[self.current_player_idx].claimed_cities.add(city2)
                 self.players[self.current_player_idx].points += self.calc_route_points(route_length)
                 self.players[self.current_player_idx].uf.union(city1, city2)
-                if route_length >= 4:
+                if route_length >= 5:
                     #print("long route attempted at length", route_length)
                     pass
                 self.players[self.current_player_idx].remaining_trains -= route_length
@@ -897,14 +912,15 @@ class GameState:
                 pass
         elif action_type == "draw_destination_tickets":
             i, j, k, player_name = action[1:]
+            destinations = []
             if i == 1:
-                destinations = [self.destination_deck.pop(0)]
+                destinations.append(self.destination_deck.pop(0))
             if j == 1:
-                destinations = [self.destination_deck.pop(1)]
+                destinations.append(self.destination_deck.pop(1))
             if k == 1:
-                destinations = [self.destination_deck.pop(2)]
+                destinations.append(self.destination_deck.pop(2))
             if i == 0 and j == 0 and k == 0:
-                destinations = [self.destination_deck.pop(0)]
+                destinations.append(self.destination_deck.pop(random.randint(0, 2)))
             self.current_player.destinations.extend(destinations)
 
     def apply_action_final(self, action):
@@ -924,12 +940,12 @@ class GameState:
     
     def is_end(self):
         # Check if the game state is terminal
-        if (self.players[self.current_player_idx].remaining_trains <= 2):
-            return True
+        for player in self.players:
+            if player.remaining_trains <= 2:
+                return True
         return False
     
     def get_legal_actions(self):
-        # TODO Need to support adding destination tickets
         legal_actions = []
         current_player = self.players[self.current_player_idx]
         unclaimed_routes = self.get_unclaimed_routes()
@@ -945,21 +961,23 @@ class GameState:
         
         # TODO - probably should bias towards not drawing from deck too much
         num_cards = sum(current_player.train_cards.values())
-        # Draw two train cards. Enumerate all possible combinations of face-up cards and deck cards
-        for i, card1 in enumerate(self.face_up_cards):
-            for j, card2 in enumerate(self.face_up_cards):
-                if i != j:
-                    legal_actions.append(("draw_two_train_cards", i, card1, j, card2, current_player.name))
-            legal_actions.append(("draw_two_train_cards", i, card1, "deck", "deck", current_player.name))
-        legal_actions.append(("draw_two_train_cards", "deck", "deck", "deck", "deck", current_player.name))
+        if len(self.train_deck) > 5:
+            # Draw two train cards. Enumerate all possible combinations of face-up cards and deck cards
+            for i, card1 in enumerate(self.face_up_cards):
+                for j, card2 in enumerate(self.face_up_cards):
+                    if i != j:
+                        legal_actions.append(("draw_two_train_cards", i, card1, j, card2, current_player.name))
+                legal_actions.append(("draw_two_train_cards", i, card1, "deck", "deck", current_player.name))
+            legal_actions.append(("draw_two_train_cards", "deck", "deck", "deck", "deck", current_player.name))
         # TODO - Definitely should bias towards not drawing destinations if the player hasnt completed many yet
         num_destinations = len(current_player.destinations)
         if num_destinations < 8:
-            # Draw destination tickets: scry three, keep minimum one
-            for i in range(2):
-                for j in range(2):
-                    for k in range(2):
-                        legal_actions.append(("draw_destination_tickets", i, j, k, current_player.name))
+            if len(self.destination_deck) >= 5:
+                # Draw destination tickets: scry three, keep minimum one
+                for i in range(2):
+                    for j in range(2):
+                        for k in range(2):
+                            legal_actions.append(("draw_destination_tickets", i, j, k, current_player.name))
         
         return legal_actions
     
@@ -979,9 +997,13 @@ class GameState:
             if any(player.uf.is_connected(city1, city2off) for city2off in one_off):
                 return True
         return False
+    
+    def switch_turn(self):
+        self.current_player_idx = (self.current_player_idx + 1) % len(self.players)
+        self.current_player = self.players[self.current_player_idx]
 
-    def game_result(self,game_num):
-        #print(f"Game {game_num}:")
+    def game_result(self, game_num):
+        #print(f"Game {game_num}: Score p1 ({self.players[0].points}) vs p2 ({self.players[1].points})")
         player = self.players[self.current_player_idx]
         destination_results = self.check_all_destinations(player)
 
@@ -992,11 +1014,24 @@ class GameState:
             else:
                 player.points -= destination.points
                 #print(f"Destination between {destination.city1} and {destination.city2} has not been completed. Total score: {player.points}")
-        console.print_results(game_num,player)
+        #console.print_results(game_num,player)
+        if self.update:
+            self.update.publish("mcts_update", game_num, player)
+        #return player.points - self.players[(self.current_player_idx + 1) % 2].points # TODO TRY THIS?
         return player.points
     
+    def print_score(self):
+        for player in self.players:
+            destination_results = self.check_all_destinations(player)
+            for destination, is_complete in destination_results:
+                if is_complete:
+                    player.points += destination.points
+                else:
+                    player.points -= destination.points
+            print(f"Perceived Score {player.name}: {player.points}")
+    
     def game_result_final(self,game_num):
-        console.stop()
+        #console.stop()
         print(f"Game {game_num}:")
         for player in self.players:
             print(f"Score {player.name}: {player.points}")
@@ -1012,7 +1047,6 @@ class GameState:
         
 
 # General game class which stores players, current player index, train deck, destination deck, face-up cards
-# TODO - Implement final scoring
 class TicketToRide:
     def __init__(self):
         self.game_state = GameState()
@@ -1064,7 +1098,6 @@ class TicketToRide:
         
         for city1, city2, route in unclaimed_routes:
             # Check if player has enough cards to claim the route
-            # TODO allow combinations of wild and other colors
             if route.color == Color.GRAY:
                 for color in Color:
                     if player.train_cards[color] >= route.length:
@@ -1275,6 +1308,7 @@ class TicketToRide:
         print(f"{player.name}'s current destinations: {', '.join(self.formatted_destinations(player))}")
 
 def main():
+    timestart=time.time()
     game = TicketToRide()
     # Create players
     players = [
@@ -1283,6 +1317,7 @@ def main():
         Player(name="Player 2", train_cards={color: 0 for color in Color}, 
             destinations=[], claimed_connections=[], points=0, turn=1)
     ]
+
     print("\n" + "_" * 200 + "\n")
     # Set up and start the game
     game.setup_game(players)
@@ -1290,37 +1325,46 @@ def main():
     print("You can type back to go to the previous menu option")
     print("Enjoy Ticket to Ride!")
 
+    console = LiveConsole()
+    num_sims = 2000
+    console.total_expected_games = num_sims
+
     # Main game loop
     game_end = False
     while not game_end:
-        # Instantiate MCTS for Player 1
-        mcts_player = MCTS(game.game_state)
-        mcts_player2 = MCTS(game.game_state)
         current_player = game.game_state.players[game.game_state.current_player_idx]
+        
         if current_player.name == "Player 1":
+            print(f"\nTurn: {current_player.turn}")
+            console.start_live()
             # Use MCTS to determine the best action for Player 1
-            best_action = mcts_player.best_action(simulations_number=400)
+            mcts_player = MCTS(game.game_state)
+            best_action = mcts_player.best_action_multi (console.update_display, num_sims)
             game.game_state.apply_action_final(best_action)
+            current_player.turn += 1
             console.stop()
-        
+        # Player 2 Random Moves
         elif current_player.name == "Player 2":
-            best_action = mcts_player2.best_action(simulations_number=400)
+            random = RandomAgent(game.game_state)
+            move = random.get_action()
+            game.game_state.apply_action_final(move)
+            current_player.turn += 1
+            #console.stop()
+
+        """ Player 2 MCTS
+        elif current_player.name == "Player 2":
+            mcts_player2 = MCTS(game.game_state)
+            best_action = mcts_player2.best_action_multi(simulations_number=2000)
             game.game_state.apply_action_final(best_action)
-            console.stop()
-        
+            #console.stop()
         """
+        """ Player 2 Manual
         else:
             # Let Player 2 play their turn manually
             game.play_turn(current_player)
         """
         
-        for player in game.game_state.players:
-            player.turn += 1
-        print(f"\nTurn: {player.turn}")
-        console.start_live()
-        
         game.game_state.update_player_turn()
-        
         
         # Check end game condition
         if current_player.remaining_trains <= 2:
@@ -1328,9 +1372,19 @@ def main():
     
     # Calculate final scores
     game.game_state.game_result_final(1)
-    game.game_state.visualizer = TicketToRideVisualizer(game.game_state)
-    game.game_state.visualizer.visualize_game_map()
 
-    print("End of game")
+    #game.game_state.visualizer = TicketToRideVisualizer(game.game_state)
+    #game.game_state.visualizer.visualize_game_map() #visualize the final state of the game board
+
+    timeend=time.time()
+    elapsed_time = timeend - timestart
+    minutes = int(elapsed_time // 60)
+    seconds = int(elapsed_time % 60)
+
+    print(f"Time taken: {minutes} minutes and {seconds} seconds")
+
+    game.game_state.print_owned_routes()
+
 if __name__ == "__main__":
     main()
+    
