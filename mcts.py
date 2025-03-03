@@ -4,25 +4,40 @@ import random
 import time
 from multiprocessing import Pipe
 import threading
+from graph import visualize_mcts_tree as viz_mcts
 
 class MCTSNode:
     def __init__(self, state, parent=None, action=None):
         self.state = state
-        self.next_state = state.copy()
         self.parent = parent
         self.action = action
+        self.action_type = action[0] if action else None
         self.children = []
         self.visits = 0
         self.value = 0.0
 
     def is_fully_expanded(self):
         possible_actions = self.state.get_legal_actions()
-        max_children = int(math.ceil(math.sqrt(self.visits)))  # Progressive widening
+
+        const = 1.5 # TODO modify exploration constant
+        max_children = int(math.ceil(const * math.sqrt(self.visits)))
         return len(self.children) >= min(len(possible_actions), max_children)
+        """ full expansion
+        tried_actions = [child.action for child in self.children]
+        expanded = len(tried_actions) >= len(possible_actions)
+        if expanded:
+            # Check if all possible actions have been tried
+            for action in possible_actions:
+                if action not in tried_actions:
+                    expanded = False
+                    break
+        # A node is fully expanded only when ALL possible actions have been tried
+        return expanded
+        """
 
     def expand(self):
         # Get all possible actions from the current state
-        possible_actions = self.next_state.get_legal_actions()
+        possible_actions = self.state.get_legal_actions()
         if len(possible_actions) == 0:
             return None
         # Filter out actions that have already been tried (i.e., have corresponding child nodes)
@@ -30,43 +45,48 @@ class MCTSNode:
         if len(untried_actions) == 0:
             return None
         
+        # Split actions into their respective types to make random selection fair
+        random_type = random.choice(['draw_two_train_cards', 'claim_route', 'draw_destination_tickets'])
+        action_type = [action for action in untried_actions if action[0] == random_type]
+        if not action_type:
+            action_type = untried_actions
         # MCTS agent plays a move
-        action = random.choice(untried_actions)
-        self.next_state = self.state.copy()
-        self.next_state.apply_action(action)
+        action = random.choice(action_type)
+        child_state = self.state.copy()
+        child_state.apply_action(action)
 
         # Opponent plays immediately after
-        self.next_state.switch_turn()
-        opponent_actions = self.next_state.get_legal_actions()
+        child_state.switch_turn()
+        opponent_actions = child_state.get_legal_actions()
         if opponent_actions:
             opponent_action = random.choice(opponent_actions)  # TODO - Could make this more advanced
-            self.next_state.apply_action(opponent_action)
+            child_state.apply_action(opponent_action)
             
         # Back to MCTS agent's turn
-        self.next_state.switch_turn()        
-        child_node = MCTSNode(self.next_state, parent=self, action=action)
+        child_state.switch_turn()        
+        child_node = MCTSNode(child_state, parent=self, action=action)
         self.children.append(child_node)
         return child_node
 
-    def best_child(self, c_param=1.5):
+    def best_child(self, c_param=2.5):
         if not self.children:
             return None
-
         choices_weights = []
         for child in self.children:
             if child.visits == 0:
                 choices_weights.append(float('inf'))
             else:
-                one_off_bonus = 2 if child.state.one_off() else 0 # TODO test without this ofc
+                #one_off_bonus = 2 if child.state.one_off() else 0 # TODO test without this ofc
                 weight = (child.value / child.visits) + \
-                         c_param * math.sqrt((2 * math.log(self.visits) / child.visits)) + \
-                         one_off_bonus
+                         c_param * math.sqrt((2 * math.log(self.visits) / child.visits))
                 choices_weights.append(weight)
         return self.children[choices_weights.index(max(choices_weights))]
 
     def rollout(self, sim_num):
         current_rollout_state = self.state.copy()
-        while not current_rollout_state.is_end():
+        depth = 0
+        max_depth = 100
+        while not current_rollout_state.is_end() and depth < max_depth:
             possible_moves = current_rollout_state.get_legal_actions()
             if not possible_moves:
                 break
@@ -80,11 +100,17 @@ class MCTSNode:
             opponent_action = random.choice(opponent_actions)  # TODO - Could make this more advanced
             current_rollout_state.apply_action(opponent_action)
             # Back to MCTS agent's turn
-            current_rollout_state.switch_turn()      
+            current_rollout_state.switch_turn()    
+            depth += 1  
         return current_rollout_state
 
     def rollout_policy(self, possible_moves):
-        return random.choice(possible_moves)
+        # Split actions into their respective types to make random selection fair
+        random_type = random.choice(['draw_two_train_cards', 'claim_route', 'draw_destination_tickets'])
+        action_type = [action for action in possible_moves if action[0] == random_type]
+        if not action_type:
+            return random.choice(possible_moves)
+        return random.choice(action_type)
 
     def backpropagate(self, result):
         self.visits += 1
@@ -100,8 +126,12 @@ class MCTS:
     def best_action(self, simulations_number):
         for sim_num in range(simulations_number):
             v = self.tree_policy()
-            reward = v.rollout(sim_num)
+            state = v.rollout(sim_num)
+            player = state.players[state.current_player_idx]
+            reward = state.game_result(sim_num)
             v.backpropagate(reward)
+        viz_mcts(self.root, max_depth=4, 
+                       filename=f"mcts_tree_turn_{self.root.state.current_player.turn}.png")
         return self.root.best_child().action
     
     def best_action_multi(self, update_callback, simulations_number, num_processes=8):
@@ -138,8 +168,9 @@ class MCTS:
                 ) for i in range(num_processes)
             ]
             
-            # collect results
-            results = [future.result() for future in futures]
+            # collect results - these are now MCTS objects
+            mcts_results = [future.result() for future in futures]
+        
         # stop monitoring thread
         monitor_running.clear()
         if update_callback:
@@ -151,16 +182,34 @@ class MCTS:
         for conn in child_connections:
             conn.close()
 
-        if not results:
+        if not mcts_results:
             return None
         
-        valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        # Get best actions from each MCTS instance
+        valid_actions = []
+        for mcts in mcts_results:
+            best_child = mcts.root.best_child() if mcts and mcts.root and mcts.root.children else None
+            if best_child:
+                valid_actions.append((best_child.action, mcts))
+        
+        if not valid_actions:
             return None
-            
-        best = max(set(valid_results), key=valid_results.count)
-        best.state.print_score()
-        return best.action
+                
+        # Find the most common action
+        actions = [a[0] for a in valid_actions]
+        best_action = max(set(actions), key=actions.count)
+        
+        # Find a MCTS instance that chose this action
+        for action, mcts in valid_actions:
+            if action == best_action:
+                # Visualize the tree from this instance
+                viz_mcts(mcts.root, max_depth=3, 
+                        filename=f"mcts_tree_turn_{mcts.root.state.current_player.turn}.png")
+                mcts.root.state.print_score()
+                return best_action
+        
+        # Fallback (shouldn't reach here)
+        return valid_actions[0][0] if valid_actions else None
 
     def tree_policy(self):
         current_node = self.root
@@ -185,8 +234,6 @@ class MCTS:
 
 def monitor_pipes(connections, update_callback, running_event):
     """Monitor all pipe connections for updates and call the update callback"""
-    
-    
     total_games = 0
 
     try:
@@ -250,4 +297,5 @@ def run_simulation(game_state, simulations_number, pipe_connection, worker_id):
         # must close pipe
         pipe_connection.close()
     
-    return local_mcts.root.best_child()
+    # Return the entire MCTS object instead of just the best child
+    return local_mcts

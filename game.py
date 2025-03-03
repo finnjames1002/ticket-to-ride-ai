@@ -7,7 +7,7 @@ import random
 import copy
 from mcts import MCTS
 from console import LiveConsole
-from graph import TicketToRideVisualizer
+#from graph import TicketToRideVisualizer
 from fw import FloydWarshall
 from randomAgent import RandomAgent
 
@@ -56,7 +56,7 @@ class Destination:
     city2: str
     points: int
 
-# Player class to store player information # TODO - move turn into gamestate
+# Player class to store player information
 @dataclass
 class Player:
     name: str
@@ -108,9 +108,12 @@ class GameState:
         self.train_deck: List[Color] = []
         self.destination_deck: List[Destination] = []
         self.face_up_cards: List[Color] = []
-        self.visualizer = TicketToRideVisualizer(self)
+        #self.visualizer = TicketToRideVisualizer(self)
         self.fw = None    
         self.update = None
+        self._unclaimed_routes_cache = None    # Cache for unclaimed routes
+        self._cache_valid = False   # Flag to indicate if cache needs update
+        
 
     def init(self):
         self.initialise_destination_deck()
@@ -747,47 +750,134 @@ class GameState:
                 ]
             }
         }
+         # Add these indices at the end:
+        self.city_to_routes = {}  # Maps cities to their routes
+        self.route_pairs = {}     # Maps (city1,city2) to route objects
+        
+        # Build indices
+        for city1, connections in self.routes.items():
+            if city1 not in self.city_to_routes:
+                self.city_to_routes[city1] = []
+                
+            for city2, routes_list in connections.items():
+                # Get canonical order of cities (alphabetical)
+                key = (city1, city2) if city1 < city2 else (city2, city1)
+                
+                # Store in route_pairs
+                if key not in self.route_pairs:
+                    self.route_pairs[key] = []
+                self.route_pairs[key].extend(routes_list)
+                
+                # Store in city_to_routes
+                self.city_to_routes[city1].extend([(city2, route) for route in routes_list])
+
+        self.city_names = sorted(list(set(
+            [city for routes in self.routes.values() 
+                for city in routes.keys()] + 
+            [city for city in self.routes.keys()]
+        )))
+        self.city_to_idx = {city: i for i, city in enumerate(self.city_names)}
+        self.idx_to_city = {i: city for i, city in enumerate(self.city_names)}
+        
+        # Create adjacency matrix for fast lookups
+        n = len(self.city_names)
+        self.adjacency = [[[] for _ in range(n)] for _ in range(n)]
+        
+        for city1, connections in self.routes.items():
+            i = self.city_to_idx[city1]
+            for city2, routes_list in connections.items():
+                j = self.city_to_idx[city2]
+                self.adjacency[i][j] = routes_list
+
+    def route_lookup(self, city1: str, city2: str) -> List[Route]:
+        """AM route lookup for adjacency between two cities"""
+        if hasattr(self, 'city_to_idx') and city1 in self.city_to_idx and city2 in self.city_to_idx:
+            i = self.city_to_idx[city1]
+            j = self.city_to_idx[city2]
+            return self.adjacency[i][j]
+        return self.get_routes_between_cities(city1, city2)
 
     def update_player_turn(self):
         self.current_player_idx = (self.current_player_idx + 1) % len(self.players)
         self.current_player = self.players[self.current_player_idx]
 
     def get_routes_from_city(self, city: str) -> Dict[str, List[Route]]:
-        """Get all routes from a specific city."""
-        return self.routes.get(city, {})
+        """Get all routes from a city using optimized data structure"""
+        if hasattr(self, 'city_to_routes') and city in self.city_to_routes:
+            # Group by city2
+            result = {}
+            for city2, route in self.city_to_routes[city]:
+                if city2 not in result:
+                    result[city2] = []
+                result[city2].append(route)
+            return result
+        else:
+            # Fall back to original implementation
+            if city in self.routes:
+                return self.routes[city]
+            return {}
 
     def get_routes_between_cities(self, city1: str, city2: str) -> List[Route]:
-        """Get both routes between two specific cities."""
-        routes = []
-        # Check direct routes
-        if city2 in self.routes.get(city1, {}):
-            routes.extend(self.routes[city1][city2])
-        # Check reverse routes
-        if city1 in self.routes.get(city2, {}):
-            routes.extend(self.routes[city2][city1])
-        return routes
-    
+        """Get routes between cities using optimized lookup"""
+        # First, try adjacency matrix for fastest lookup
+        if hasattr(self, 'city_to_idx') and city1 in self.city_to_idx and city2 in self.city_to_idx:
+            i = self.city_to_idx[city1]
+            j = self.city_to_idx[city2]
+            if self.adjacency[i][j]:  # If routes exist
+                return self.adjacency[i][j]
+        
+        # Next, try route_pairs
+        if hasattr(self, 'route_pairs'):
+            key = (city1, city2) if city1 < city2 else (city2, city1)
+            if key in self.route_pairs:
+                return self.route_pairs[key]
+        
+        # Fall back to original implementation
+        if city1 in self.routes and city2 in self.routes[city1]:
+            return self.routes[city1][city2]
+        return []
+        
     def get_unclaimed_routes(self) -> List[tuple[str, str, Route]]:
-        """Get all unclaimed routes in the game."""
+        """Get all unclaimed routes using cached results"""
+        # Return cached result if available
+        if self._unclaimed_routes_cache is not None and self._cache_valid:
+            return self._unclaimed_routes_cache
+        
+        # Otherwise compute and cache
         unclaimed = []
-        for city1, connections in self.routes.items():
-            for city2, routes in connections.items():
-                for route in routes:
-                    if route.claimed_by is None:
+        seen = set()
+        
+        for city1, routes in self.city_to_routes.items():
+            for city2, route in routes:
+                # Use canonical ordering to avoid duplicates
+                if city1 < city2 and route.claimed_by is None:
+                    key = (city1, city2)
+                    if key not in seen:
                         unclaimed.append((city1, city2, route))
+                        seen.add(key)
+        
+        # Store in cache
+        self._unclaimed_routes_cache = unclaimed
+        self._cache_valid = True
         return unclaimed
 
     def claim_route_helper(self, color: Color, player: str, routes) -> bool:
+        """Helper to claim a route and update player state"""
         for route in routes:
             claimed = route.is_claimed()
-            if (color == Color.WILD or route.color == color or route.color == Color.GRAY) and not (claimed):
+            if (color == Color.WILD or route.color == color or route.color == Color.GRAY) and not claimed:
+                # Update route state
                 route.claim(player)
-                return True
-        return False
-
+                # Invalidate cache when route is claimed
+                self._cache_valid = False    
+            else:
+                onewayclaim = True
+                
+        return True
+    
     def claim_route(self, city1: str, city2: str, color: Color, player: str) -> bool:
         """Attempt to claim a route between two cities."""
-        routes = self.get_routes_between_cities(city1, city2)
+        routes = self.route_lookup(city1, city2)
         if len(routes) == 4:
             direction1 = [routes[0],routes[2]]
             d1 = self.claim_route_helper(color, player, direction1)
@@ -801,9 +891,10 @@ class GameState:
         #print (f"Color: {color} is not valid for route between {city1} and {city2}")
         return False
 
-    def get_route_length(self, city1: str, city2: str, color: Color) -> Optional[int]:
+    def get_route_length(self, city1: str, city2: str) -> Optional[int]:
         """Get the length of a specific route."""
-        routes = self.get_routes_between_cities(city1, city2)
+        routes = self.route_lookup(city1, city2)
+        return routes[0].length
         for route in routes:
             return route.length
         return None
@@ -859,25 +950,97 @@ class GameState:
         for player in self.players:
             print(f"{player.name} has claimed the following routes:")
             for city1, city2, color in player.claimed_connections:
-                print(f"{city1} to {city2} with {color} and length {self.get_route_length(city1, city2, color)}")
+                print(f"{city1} to {city2} with {color} and length {self.get_route_length(city1, city2)}")
 
     # MCTS methods
     def copy(self):
-        # Store the update reference
-        update_ref = self.update
+        # Create a new instance
+        new_state = GameState()
         
-        # Set it to None temporarily for copying
-        self.update = None
+        # Copy scalar values
+        new_state.current_player_idx = self.current_player_idx
         
-        # Create copy
-        new_state = copy.deepcopy(self)
+        # Create simplified copies of routes (most expensive structure)
+        new_state.routes = {}
+        for city1, connections in self.routes.items():
+            new_state.routes[city1] = {}
+            for city2, routes_list in connections.items():
+                # Create new Route objects but avoid deep recursion
+                new_state.routes[city1][city2] = [Route(r.length, r.color, r.claimed_by) for r in routes_list]
         
-        # Restore the update reference in both objects
-        self.update = update_ref
-        new_state.update = update_ref
+        # Copy simple collections directly
+        new_state.train_deck = self.train_deck.copy() if self.train_deck else []
+        new_state.destination_deck = self.destination_deck.copy() if self.destination_deck else []
+        new_state.face_up_cards = self.face_up_cards.copy() if self.face_up_cards else []
+        new_state.score = {k: v for k, v in self.score.items()} if self.score else {}
+        
+        # Copy players more efficiently
+        new_state.players = []
+        for player in self.players:
+            # Create new player with basic attributes
+            new_player = Player(name=player.name, remaining_trains=player.remaining_trains)
+            
+            # Copy collections efficiently
+            new_player.train_cards = {color: count for color, count in player.train_cards.items()}
+            new_player.destinations = player.destinations.copy() if player.destinations else []
+            new_player.claimed_connections = player.claimed_connections.copy() if player.claimed_connections else []
+            new_player.claimed_cities = set(player.claimed_cities) if player.claimed_cities else set()
+            
+            # Copy scalar values
+            new_player.points = player.points
+            new_player.turn = player.turn
+            
+            # Recreate UnionFind instead of copying it
+            if player.uf:
+                new_player.uf = UnionFind(new_state.routes.keys())
+                # Only rebuild connections that matter
+                for city1, city2, _ in player.claimed_connections:
+                    new_player.uf.union(city1, city2)
+            
+            new_state.players.append(new_player)
+        
+        # Fix current player reference
+        new_state.current_player = new_state.players[new_state.current_player_idx] if new_state.players else None
+        
+        # Copy indexing structures (these are mostly immutable after creation)
+        if hasattr(self, 'city_names'):
+            new_state.city_names = self.city_names.copy()
+        if hasattr(self, 'city_to_idx'):
+            new_state.city_to_idx = self.city_to_idx.copy()
+        if hasattr(self, 'idx_to_city'):
+            new_state.idx_to_city = self.idx_to_city.copy()
+        
+        # More efficient copying of lookup structures
+        if hasattr(self, 'city_to_routes'):
+            new_state.city_to_routes = {}
+            for city, routes in self.city_to_routes.items():
+                new_state.city_to_routes[city] = routes.copy()
+        
+        if hasattr(self, 'route_pairs'):
+            new_state.route_pairs = {}
+            for key, routes in self.route_pairs.items():
+                new_state.route_pairs[key] = [Route(r.length, r.color, r.claimed_by) for r in routes]
+        
+        # Efficiently copy adjacency matrix if it exists
+        if hasattr(self, 'adjacency') and self.adjacency:
+            n = len(self.adjacency)
+            new_state.adjacency = [[[] for _ in range(n)] for _ in range(n)]
+            for i in range(n):
+                for j in range(n):
+                    if self.adjacency[i][j]:  # Only copy non-empty lists
+                        new_state.adjacency[i][j] = [Route(r.length, r.color, r.claimed_by) for r in self.adjacency[i][j]]
+        
+        # Create fresh cache for better performance
+        new_state._unclaimed_routes_cache = None
+        new_state._cache_valid = False
+        
+        # Handle FloydWarshall - lazy instantiation
+        new_state.fw = self.fw
+        
+        # Don't copy update reference
+        new_state.update = None
         
         return new_state
-    
     
     def apply_action(self, action):
         action_type = action[0]
@@ -894,7 +1057,7 @@ class GameState:
         elif action_type == "claim_route":
             city1, city2, color, player_name = action[1:]
             if self.claim_route(city1, city2, color, player_name):
-                route_length = self.get_route_length(city1, city2, color)
+                route_length = self.get_route_length(city1, city2)
                 if color == Color.WILD:
                     self.players[self.current_player_idx].train_cards[Color.WILD] -= route_length
                 else:
@@ -929,9 +1092,11 @@ class GameState:
         if action_type == "draw_two_train_cards":
             idx1, card1, idx2, card2, player_name = action[1:]
             print(f"{player_name} has drawn two train cards: {card1}, {card2}")
+            
         elif action_type == "claim_route":
             city1, city2, color, player_name = action[1:]
-            print(f"{player_name} has claimed a route between {city1} and {city2} with {color}")
+            route_length = self.get_route_length(city1, city2)
+            print(f"{player_name} has claimed a route of length {route_length} between {city1} and {city2} with {color}")
         if action_type == "draw_destination_tickets":
             i, j, k, player_name = action[1:]
             ijk = sum([i,j,k])
@@ -998,26 +1163,78 @@ class GameState:
                 return True
         return False
     
+    def get_longest_route_length(self, player):
+        """Calculate the longest continuous route for a player"""
+        if not player.claimed_connections:
+            return 0
+        
+        # Build adjacency list from player's claimed connections
+        connections = {}
+        for city1, city2, _ in player.claimed_connections:
+            if city1 not in connections:
+                connections[city1] = []
+            if city2 not in connections:
+                connections[city2] = []
+            connections[city1].append(city2)
+            connections[city2].append(city1)
+        
+        # DFS to find longest path from each starting city
+        max_length = 0
+        
+        def dfs(city, visited, path_length):
+            visited.add(city)
+            longest = path_length
+            
+            for next_city in connections.get(city, []):
+                if next_city not in visited:
+                    longest = max(longest, dfs(next_city, visited, path_length + 1))
+            
+            visited.remove(city)  # Backtrack
+            return longest
+        
+        # Try each city as a starting point
+        for city in player.claimed_cities:
+            if city in connections:
+                length = dfs(city, set(), 0)
+                max_length = max(max_length, length)
+        
+        return max_length
+    
     def switch_turn(self):
         self.current_player_idx = (self.current_player_idx + 1) % len(self.players)
         self.current_player = self.players[self.current_player_idx]
 
     def game_result(self, game_num):
-        #print(f"Game {game_num}: Score p1 ({self.players[0].points}) vs p2 ({self.players[1].points})")
+        self.print_score()
         player = self.players[self.current_player_idx]
+        opponent = self.players[(self.current_player_idx + 1) % len(self.players)]
+        
+        # Calculate destination ticket points
         destination_results = self.check_all_destinations(player)
-
         for destination, is_complete in destination_results:
             if is_complete:
                 player.points += destination.points
-                #print(f"Destination between {destination.city1} and {destination.city2} has been completed. Total score: {player.points}")
             else:
                 player.points -= destination.points
-                #print(f"Destination between {destination.city1} and {destination.city2} has not been completed. Total score: {player.points}")
-        #console.print_results(game_num,player)
+        
+        # Award longest route bonus (10 points)
+        player_longest = self.get_longest_route_length(player)
+        opponent_longest = self.get_longest_route_length(opponent)
+        
+        # Store the length for potential display/debugging
+        player.longest_route_length = player_longest
+        opponent.longest_route_length = opponent_longest
+        
+        # Award bonus to player with longer route
+        if player_longest > opponent_longest:
+            player.points += 10  # Bonus for longest route
+        elif player_longest < opponent_longest:
+            opponent.points += 10
+        else:
+            player.points += 10  # Award to both players in case of tie
+            opponent.points += 10  
         if self.update:
             self.update.publish("mcts_update", game_num, player)
-        #return player.points - self.players[(self.current_player_idx + 1) % 2].points # TODO TRY THIS?
         return player.points
     
     def print_score(self):
@@ -1030,9 +1247,20 @@ class GameState:
                     player.points -= destination.points
             print(f"Perceived Score {player.name}: {player.points}")
     
-    def game_result_final(self,game_num):
-        #console.stop()
+    def game_result_final(self, game_num):
         print(f"Game {game_num}:")
+        
+        # First calculate longest routes
+        longest_routes = [(player, self.get_longest_route_length(player)) for player in self.players]
+        longest_routes.sort(key=lambda x: x[1], reverse=True)
+        
+        # Award bonus to player(s) with longest route
+        if len(longest_routes) > 1 and longest_routes[0][1] > longest_routes[1][1]:
+            longest_player = longest_routes[0][0]
+            longest_player.points += 10
+            print(f"{longest_player.name} gets 10 bonus points for the longest continuous route of length {longest_routes[0][1]}!")
+        
+        # Calculate and display final scores for each player
         for player in self.players:
             print(f"Score {player.name}: {player.points}")
             destination_results = self.check_all_destinations(player)
@@ -1043,6 +1271,9 @@ class GameState:
                 else:
                     player.points -= destination.points
                     print(f"Destination between {destination.city1} and {destination.city2} has not been completed. Total score: {player.points}")
+            
+            # Show longest route length for each player
+            print(f"Longest continuous route: {self.get_longest_route_length(player)}")
             print("Final score: ", player.points)
         
 
@@ -1081,8 +1312,8 @@ class TicketToRide:
         return [f"{destination.city1} to {destination.city2} ({destination.points})" for destination in player.destinations]
 
     def print_board(self):
-        self.visualizer = TicketToRideVisualizer(self.game_state)
-        self.visualizer.visualize_game_map()
+        #self.visualizer = TicketToRideVisualizer(self.game_state)
+        #self.visualizer.visualize_game_map()
         print("=== Ticket to Ride Board ===")
         for city1, connections in sorted(self.game_state.routes.items()):
             print(f"\n{city1}:")
@@ -1235,7 +1466,7 @@ class TicketToRide:
             color = available_colors[0]
         if self.game_state.claim_route(city1, city2, color, player.name):
             # Remove cards from player's hand
-            route_length = self.game_state.get_route_length(city1, city2, color)
+            route_length = self.game_state.get_route_length(city1, city2)
             if color == Color.WILD:
                 player.train_cards[Color.WILD] -= route_length
             else:
@@ -1326,7 +1557,7 @@ def main():
     print("Enjoy Ticket to Ride!")
 
     console = LiveConsole()
-    num_sims = 2000
+    num_sims = 1000
     console.total_expected_games = num_sims
 
     # Main game loop
@@ -1336,13 +1567,17 @@ def main():
         
         if current_player.name == "Player 1":
             print(f"\nTurn: {current_player.turn}")
-            console.start_live()
+            tst = time.time()
+            #console.start_live()
             # Use MCTS to determine the best action for Player 1
             mcts_player = MCTS(game.game_state)
-            best_action = mcts_player.best_action_multi (console.update_display, num_sims)
+            #best_action = mcts_player.best_action_multi(console.update_display, num_sims)
+            best_action = mcts_player.best_action(num_sims) # single processed
             game.game_state.apply_action_final(best_action)
             current_player.turn += 1
-            console.stop()
+            tet = time.time()
+            print(f"Time taken for turn: {tet-tst} seconds")
+            #console.stop()
         # Player 2 Random Moves
         elif current_player.name == "Player 2":
             random = RandomAgent(game.game_state)
